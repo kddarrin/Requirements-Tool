@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+*.reqtrace
+*.reqtrace-journal
+*.reqtrace-wal
+*.reqtrace-shm
