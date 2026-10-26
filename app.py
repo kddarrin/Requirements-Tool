@@ -9,36 +9,18 @@ from tkinter.scrolledtext import ScrolledText
 
 from export import export_html, export_pdf
 from storage import Project, scan_code
-
-
-def table(parent, headings, widths):
-    frame = ttk.Frame(parent)
-    frame.pack(fill="both", expand=True, pady=6)
-    tree = ttk.Treeview(frame, columns=headings, show="headings", selectmode="browse", height=7)
-    for heading, width in zip(headings, widths):
-        tree.heading(heading, text=heading)
-        tree.column(heading, width=width, minwidth=65)
-    vertical = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-    horizontal = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
-    tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-    tree.grid(row=0, column=0, sticky="nsew")
-    vertical.grid(row=0, column=1, sticky="ns")
-    horizontal.grid(row=1, column=0, sticky="ew")
-    frame.rowconfigure(0, weight=1)
-    frame.columnconfigure(0, weight=1)
-    return tree
+from views import RequirementsView, TraceMatrixView, table
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Requirements Trace")
-        self.geometry("1220x760")
+        self.geometry("1320x800")
         self.minsize(980, 620)
         self.project = self.document = self.requirement = None
         self.baseline, self.busy = ("", "", None, ""), False
-        self.active_filters = ("All sections", "All types")
-        self.section_choices, self.section_filters, self.type_filters = {}, {}, {}
+        self.section_choices = {}
         self.project_controls, self.document_controls, self.requirement_controls = [], [], []
         ttk.Style(self).configure("Heading.TLabel", font=("TkDefaultFont", 15, "bold"))
         toolbar = ttk.Frame(self, padding=10)
@@ -58,20 +40,13 @@ class App(tk.Tk):
         self.button(left, "New document", self.new_document, self.project_controls, side="top")
         self.docs = table(left, ("Document",), (245,))
         self.docs.bind("<<TreeviewSelect>>", self.safe(self.select_document))
-        ttk.Label(middle, text="Requirements").pack(anchor="w")
-        requirement_actions = ttk.Frame(middle)
-        requirement_actions.pack(fill="x")
-        self.button(requirement_actions, "Add requirement", self.new_requirement, self.document_controls)
-        self.button(requirement_actions, "New section", lambda: self.new_document(True), self.document_controls)
-        self.section_filter, self.type_filter = tk.StringVar(value="All sections"), tk.StringVar(value="All types")
-        self.section_filter_box = ttk.Combobox(middle, textvariable=self.section_filter, state="readonly")
-        self.type_filter_box = ttk.Combobox(middle, textvariable=self.type_filter, state="readonly")
-        for label, box in (("Section filter", self.section_filter_box), ("Type filter", self.type_filter_box)):
-            ttk.Label(middle, text=label).pack(anchor="w", pady=(5, 0))
-            box.pack(fill="x")
-            box.bind("<<ComboboxSelected>>", self.safe(self.change_filters))
-        self.reqs = table(middle, ("ID", "Title", "Type"), (110, 180, 90))
-        self.reqs.bind("<<TreeviewSelect>>", self.safe(self.select_requirement))
+        self.notebook = ttk.Notebook(middle)
+        self.notebook.pack(fill="both", expand=True)
+        self.requirements_view = RequirementsView(self.notebook, self.select_requirement, self.new_requirement,
+                lambda: self.new_document(True), self.delete_section, self.refresh_requirements, self.confirm_edits, self.safe)
+        self.notebook.add(self.requirements_view, text="Requirements")
+        self.additional_views = []
+        self.matrix_view = self.add_view("Trace Matrix", TraceMatrixView)
         self.heading = ttk.Label(right, text="Open or create a project to begin.")
         self.heading.pack(anchor="w", pady=(0, 8))
         fields = ttk.Frame(right)
@@ -123,6 +98,16 @@ class App(tk.Tk):
             group.append(button)
         return button
 
+    def add_view(self, title, view_class):
+        view = view_class(self.notebook, self.select_requirement, self.safe)
+        self.notebook.add(view, text=title)
+        self.additional_views.append(view)
+        return view
+
+    def refresh_views(self):
+        for view in self.additional_views:
+            view.refresh(self.project, self.requirement)
+
     def sync_controls(self):
         for controls, enabled in ((self.switch_controls, True), (self.project_controls, self.project),
                                   (self.document_controls, self.document),
@@ -133,8 +118,10 @@ class App(tk.Tk):
         self.title_entry.configure(state=state)
         self.body.configure(state=state)
         self.type_entry.configure(state=state)
-        for box in (self.section_entry, self.section_filter_box, self.type_filter_box):
-            box.configure(state="readonly" if state == "normal" else "disabled")
+        self.section_entry.configure(state="readonly" if state == "normal" else "disabled")
+        self.requirements_view.set_enabled(bool(self.document) and not self.busy)
+        for view in self.additional_views:
+            view.set_enabled(bool(self.project) and not self.busy)
 
     def editor_values(self):
         return (self.title_text.get().strip(), self.body.get("1.0", "end-1c").strip(),
@@ -159,7 +146,7 @@ class App(tk.Tk):
         if self.project:
             self.project.close()
         self.project, self.document = project, None
-        self.active_filters = ("All sections", "All types")
+        self.requirements_view.active_filters = ("All sections", "All types")
         self.docs.delete(*self.docs.get_children())
         for doc in project.documents():
             self.docs.insert("", "end", iid=str(doc["id"]), values=(doc["name"],))
@@ -199,11 +186,11 @@ class App(tk.Tk):
             if section:
                 doc = self.document
                 self.project.add_section(doc, name.get(), prefix.get())
-                self.active_filters = (f"{name.get().strip()} [{prefix.get().strip().upper()}]", "All types")
+                self.requirements_view.active_filters = (f"{name.get().strip()} [{prefix.get().strip().upper()}]", "All types")
             else:
                 doc = self.project.add_document(name.get(), prefix.get(), first_section.get())
                 self.docs.insert("", "end", iid=str(doc), values=(name.get().strip(),))
-                self.active_filters = ("All sections", "All types")
+                self.requirements_view.active_filters = ("All sections", "All types")
             self.document = doc
             self.refresh_requirements()
             self.docs.selection_set(str(doc))
@@ -211,6 +198,56 @@ class App(tk.Tk):
 
         self.button(frame, "Create section" if section else "Create document", create)
         name.focus_set()
+
+    def delete_section(self):
+        if self.busy or not self.document:
+            return
+        sections = self.project.sections(self.document)
+        if len(sections) < 2:
+            raise ValueError("Keep at least one section per document. Create another section first.")
+        preferred = self.requirements_view.selected_section() or self.section_choices.get(self.section_text.get())
+        if not self.confirm_edits():
+            return
+        window, frame = self.dialog("Delete section")
+        choices = {f"{s['name']} [{s['prefix']}]": s["id"] for s in sections}
+        source = tk.StringVar(value=next((name for name, value in choices.items() if value == preferred), next(iter(choices))))
+        destination, explanation = tk.StringVar(), tk.StringVar()
+        ttk.Label(frame, text="Section to delete").pack(anchor="w")
+        source_box = ttk.Combobox(frame, textvariable=source, values=list(choices), state="readonly", width=52)
+        source_box.pack(fill="x", pady=5)
+        ttk.Label(frame, text="Move its requirements to").pack(anchor="w")
+        destination_box = ttk.Combobox(frame, textvariable=destination, state="readonly")
+        destination_box.pack(fill="x", pady=5)
+        ttk.Label(frame, textvariable=explanation, wraplength=420).pack(anchor="w", pady=8)
+
+        def update_choices():
+            others = [name for name in choices if name != source.get()]
+            destination_box.configure(values=others)
+            if destination.get() not in others:
+                destination.set(others[0])
+            count = len(self.project.requirements(self.document, choices[source.get()]))
+            destination_box.configure(state="readonly" if count else "disabled")
+            explanation.set(f"{count} requirements will move. IDs, types, links, and code tags are preserved."
+                            if count else "This section is empty and can be removed.")
+
+        def remove():
+            section = choices[source.get()]
+            count = len(self.project.requirements(self.document, section))
+            target = choices[destination.get()] if count else None
+            message = (f"Delete {source.get()} and move {count} requirements to {destination.get()}?"
+                       if count else f"Delete empty section {source.get()}?")
+            if not messagebox.askyesno("Delete section", message, parent=window):
+                return
+            moved = self.project.delete_section(self.document, section, target)
+            self.requirements_view.forget_section(section)
+            self.refresh_requirements(self.requirement)
+            self.status.set(f"Deleted {source.get()}. {moved} requirements moved.")
+            window.destroy()
+
+        source_box.bind("<<ComboboxSelected>>", self.safe(update_choices))
+        update_choices()
+        self.button(frame, "Delete section", remove)
+        self.button(frame, "Cancel", window.destroy)
 
     def select_document(self):
         selected = self.docs.selection()
@@ -223,54 +260,21 @@ class App(tk.Tk):
                 self.docs.selection_remove(*selected)
             return
         self.document = int(selected[0])
-        self.active_filters = ("All sections", "All types")
+        self.requirements_view.active_filters = ("All sections", "All types")
         self.refresh_requirements()
 
     def refresh_choices(self):
-        sections = self.project.sections(self.document) if self.document else []
-        self.section_choices = {f"{s['name']} [{s['prefix']}]": s["id"] for s in sections}
-        self.section_filters = {"All sections": None, **self.section_choices}
-        types = self.project.types(self.document) if self.document else []
-        self.type_filters = {"All types": None, "Unspecified": "", **{f"Type: {t}": t for t in types}}
+        self.section_choices = self.requirements_view.section_choices
         self.section_entry.configure(values=list(self.section_choices))
-        suggestions = sorted(set(types) | {"Functional", "Performance", "Usability", "Interface"}, key=str.casefold)
+        suggestions = sorted(set(self.requirements_view.types) | {"Functional", "Performance", "Usability", "Interface"}, key=str.casefold)
         self.type_entry.configure(values=suggestions)
-        self.active_filters = tuple(label if label in choices else next(iter(choices))
-                                    for label, choices in zip(self.active_filters, (self.section_filters, self.type_filters)))
-        for box, variable, choices, label in zip((self.section_filter_box, self.type_filter_box),
-                (self.section_filter, self.type_filter), (self.section_filters, self.type_filters), self.active_filters):
-            box.configure(values=list(choices))
-            variable.set(label)
-
-    def change_filters(self):
-        requested = (self.section_filter.get(), self.type_filter.get())
-        if requested == self.active_filters:
-            return
-        if self.busy or not self.confirm_edits():
-            self.section_filter.set(self.active_filters[0])
-            self.type_filter.set(self.active_filters[1])
-            return
-        self.active_filters = requested
-        self.refresh_requirements()
 
     def refresh_requirements(self, select=None):
+        self.requirements_view.refresh(self.project, self.document, select)
         self.refresh_choices()
-        self.reqs.delete(*self.reqs.get_children())
-        section, kind = self.section_filters[self.active_filters[0]], self.type_filters[self.active_filters[1]]
-        rows = self.project.requirements(self.document, section, kind) if self.document else []
-        if select and not any(r["id"] == select for r in rows):
-            # An edited/moved requirement may no longer match the active filters.
-            self.active_filters = ("All sections", "All types")
-            self.section_filter.set("All sections")
-            self.type_filter.set("All types")
-            rows = self.project.requirements(self.document)
-        for row in rows:
-            self.reqs.insert("", "end", iid=row["id"], values=(row["id"], row["title"], row["type"]))
-        selected = next((r for r in rows if r["id"] == select), rows[0] if rows else None)
-        self.fill_editor(selected)
-        if selected:
-            self.reqs.selection_set(selected["id"])
-            self.reqs.see(selected["id"])
+        row = next((r for r in self.requirements_view.visible if r["id"] == self.requirements_view.selected), None)
+        self.fill_editor(row)
+        self.refresh_views()
 
     def fill_editor(self, row):
         self.requirement = row["id"] if row else None
@@ -279,13 +283,14 @@ class App(tk.Tk):
         self.body.delete("1.0", "end")
         self.body.insert("1.0", row["description"] if row else "")
         self.body.edit_reset()
-        section = row["section"] if row else self.section_filters.get(self.active_filters[0])
+        default_section, default_type = self.requirements_view.defaults()
+        section = row["section"] if row else default_section
         if section is None:
             section = self.section_choices.get(self.section_text.get())
         label = next((label for label, value in self.section_choices.items() if value == section),
                      next(iter(self.section_choices), ""))
         self.section_text.set(label)
-        self.type_text.set(row["type"] if row else self.type_filters.get(self.active_filters[1]) or "")
+        self.type_text.set(row["type"] if row else default_type or "")
         self.baseline = self.editor_values()
         label = "New requirement — ID assigned when saved" if self.document else "Select or create a document."
         self.heading.configure(text=self.requirement or label)
@@ -296,24 +301,29 @@ class App(tk.Tk):
                 for target in trace[key]:
                     self.traces.insert("", "end", values=(kind, target))
         self.sync_controls()
+        for view in self.additional_views:
+            view.highlight(self.requirement)
 
-    def select_requirement(self):
-        selected = self.reqs.selection()
-        if not selected or selected[0] == self.requirement:
-            return
-        if self.busy or not self.confirm_edits():
-            if self.requirement:
-                self.reqs.selection_set(self.requirement)
-            else:
-                self.reqs.selection_remove(*selected)
-            return
-        row = next(r for r in self.project.requirements(self.document) if r["id"] == selected[0])
-        self.fill_editor(row)
-        self.reqs.selection_set(selected[0])
+    def select_requirement(self, requirement):
+        if self.busy:
+            return False
+        if requirement == self.requirement:
+            return True
+        if not self.confirm_edits():
+            return False
+        row = next((r for r in self.project.requirements() if r["id"] == requirement), None)
+        if row is None:
+            return False
+        if self.document != row["document"]:
+            self.requirements_view.active_filters = ("All sections", "All types")
+        self.document = row["document"]
+        self.docs.selection_set(str(self.document))
+        self.refresh_requirements(requirement)
+        return True
 
     def new_requirement(self):
         if self.confirm_edits():
-            self.reqs.selection_remove(*self.reqs.selection())
+            self.requirements_view.select(None)
             self.fill_editor(None)
             self.title_entry.focus_set()
 
@@ -366,6 +376,7 @@ class App(tk.Tk):
         self.project.unlink(parent, child)
         # Refresh only the traces so unsaved editor changes survive unlinking.
         self.traces.delete(selected[0])
+        self.refresh_views()
 
     def follow_trace(self):
         selected = self.traces.selection()
@@ -376,11 +387,8 @@ class App(tk.Tk):
             self.clipboard_clear()
             self.clipboard_append(target)
             self.status.set(f"Copied {target}")
-        elif self.confirm_edits():
-            row = next(r for r in self.project.requirements() if r["id"] == target)
-            self.document = row["document"]
-            self.docs.selection_set(str(self.document))
-            self.refresh_requirements(target)
+        else:
+            self.select_requirement(target)
 
     def scan(self):
         if not self.confirm_edits():

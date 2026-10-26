@@ -1,5 +1,6 @@
 """Run: python -m unittest -v. PDF and live GUI checks skip if unavailable."""
 import importlib.util
+from contextlib import closing
 from pathlib import Path
 import re
 import sqlite3
@@ -100,6 +101,70 @@ class ProjectTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.project.save_requirement(self.system, parent, "Invalid move", "", iom)
 
+    def test_delete_section_moves_every_requirement_and_keeps_ids_and_links(self):
+        general = self.project.sections(self.software)[0]["id"]
+        iom = self.project.add_section(self.software, "IOM", "SHLRIOM")
+        first = self.project.save_requirement(self.software, None, "Functional", "Text", general, "Functional")
+        second = self.project.save_requirement(self.software, None, "Usability", "Other text", general, "Usability")
+        deleted = self.add(self.software, "Retired")
+        self.project.delete_requirement(deleted)
+        parent = self.add(self.system)
+        self.project.link(parent, first)
+        self.project.link(parent, second)
+        self.project.replace_code_refs([(first, "source.py", 7)])
+        before = {r["id"]: r for r in self.project.matrix()}
+        self.assertEqual(self.project.delete_section(self.software, general, iom), 2)
+        after = {r["id"]: r for r in self.project.matrix()}
+        for requirement in (first, second):
+            self.assertEqual(after[requirement]["section"], iom)
+            for field in ("id", "title", "description", "type", "parents", "children", "code"):
+                self.assertEqual(after[requirement][field], before[requirement][field])
+        self.assertEqual([s["id"] for s in self.project.sections(self.software)], [iom])
+        self.assertEqual(self.project.save_requirement(self.software, None, "New IOM", "", iom), "SHLRIOM1")
+        new_doc = self.project.add_document("Reused prefix", "EBBSYS")
+        self.assertEqual(self.add(new_doc), "EBBSYS4")
+        self.assertEqual(list(self.project.db.execute("PRAGMA foreign_key_check")), [])
+
+    def test_delete_empty_section_retains_deleted_ids(self):
+        general = self.project.sections(self.software)[0]["id"]
+        self.project.add_section(self.software, "IOM", "SHLRIOM")
+        requirement = self.add(self.software)
+        self.project.delete_requirement(requirement)
+        self.assertEqual(self.project.delete_section(self.software, general), 0)
+        tombstone = self.project.db.execute("SELECT * FROM requirements WHERE id=?", (requirement,)).fetchone()
+        self.assertEqual(tombstone["deleted"], 1)
+        self.assertIsNone(tombstone["section"])
+        recreated = self.project.add_section(self.software, "General", "EBBSYS")
+        self.assertEqual(self.project.save_requirement(self.software, None, "New", "", recreated), "EBBSYS2")
+
+    def test_invalid_section_deletion_preserves_data(self):
+        general = self.project.sections(self.software)[0]["id"]
+        self.add(self.software)
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            self.project.delete_section(self.software, general)
+        iom = self.project.add_section(self.software, "IOM", "SHLRIOM")
+        foreign = self.project.sections(self.system)[0]["id"]
+        before = self.project.matrix()
+        for section, target in ((general, None), (general, general), (general, foreign), (general, 999),
+                                (foreign, iom), (999, iom)):
+            with self.subTest(section=section, target=target), self.assertRaises(ValueError):
+                self.project.delete_section(self.software, section, target)
+            self.assertEqual(self.project.matrix(), before)
+            self.assertEqual(len(self.project.sections(self.software)), 2)
+
+    def test_section_delete_failure_rolls_back_moves_and_prefix_change(self):
+        general = self.project.sections(self.software)[0]["id"]
+        iom = self.project.add_section(self.software, "IOM", "SHLRIOM")
+        self.add(self.software)
+        before = self.project.matrix()
+        self.project.db.execute("CREATE TRIGGER reject_section_delete BEFORE DELETE ON sections "
+                                "BEGIN SELECT RAISE(ABORT, 'Simulated delete failure'); END")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.project.delete_section(self.software, general, iom)
+        self.assertEqual(self.project.matrix(), before)
+        self.assertEqual(self.project.documents()[1]["prefix"], "EBBSYS")
+        self.assertEqual(len(self.project.sections(self.software)), 2)
+
     def test_filters_and_duplicates_span_sections_within_document(self):
         general = self.project.sections(self.software)[0]["id"]
         iom = self.project.add_section(self.software, "IOM", "SHLRIOM")
@@ -114,7 +179,7 @@ class ProjectTests(unittest.TestCase):
 
     def test_v1_migration_preserves_ids_links_refs_and_reserved_numbers(self):
         path = self.folder / "legacy.reqtrace"
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db, db:
             db.executescript(SCHEMA)
             db.executemany("INSERT INTO documents(id,name,prefix,next_number) VALUES (?,?,?,?)",
                            [(1, "System", "SYS", 2), (2, "Software", "SHLRSCM", 4)])
@@ -145,12 +210,12 @@ class ProjectTests(unittest.TestCase):
 
     def test_failed_migration_rolls_back_all_schema_changes(self):
         path = self.folder / "inconsistent.reqtrace"
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db, db:
             db.executescript(SCHEMA)
             db.execute("ALTER TABLE requirements ADD COLUMN type TEXT")
         with self.assertRaises(sqlite3.Error):
             Project(path)
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 1)
             self.assertNotIn("section", [r[1] for r in db.execute("PRAGMA table_info(requirements)")])
             self.assertFalse(db.execute("SELECT 1 FROM sqlite_master WHERE name='sections'").fetchone())
@@ -260,17 +325,20 @@ class ProjectTests(unittest.TestCase):
 
 class ControllerTests(unittest.TestCase):
     def test_cancel_filter_change_restores_both_filters(self):
-        from app import App
-        state = SimpleNamespace(section_filter=Mock(), type_filter=Mock(), busy=False,
-                                active_filters=("All sections", "All types"), confirm_edits=lambda: False)
+        from views import RequirementsView
+        state = SimpleNamespace(section_filter=Mock(), type_filter=Mock(), enabled=True,
+                                active_filters=("All sections", "All types"), confirm_edits=lambda: False,
+                                section_box=Mock(), type_box=Mock(),
+                                section_filters={"All sections": None}, type_filters={"All types": None})
+        state.show_filters = lambda: RequirementsView.show_filters(state)
         state.section_filter.get.return_value = "IOM [SHLRIOM]"
         state.type_filter.get.return_value = "Type: Usability"
-        App.change_filters(state)
+        RequirementsView.change_filters(state)
         state.section_filter.set.assert_called_once_with("All sections")
         state.type_filter.set.assert_called_once_with("All types")
 
     def test_saved_requirement_outside_filters_is_revealed(self):
-        from app import App
+        from views import RequirementsView
         with TemporaryDirectory() as folder:
             project = Project(Path(folder) / "filters.reqtrace", create=True)
             try:
@@ -278,43 +346,38 @@ class ControllerTests(unittest.TestCase):
                 scm = project.sections(doc)[0]["id"]
                 iom = project.add_section(doc, "IOM", "SHLRIOM")
                 requirement = project.save_requirement(doc, None, "Moved", "", iom, "Usability")
-                state = SimpleNamespace(project=project, document=doc, reqs=Mock(), refresh_choices=Mock(),
-                                        section_filter=Mock(), type_filter=Mock(), fill_editor=Mock(),
-                                        active_filters=("SCM", "Functional"),
-                                        section_filters={"SCM": scm}, type_filters={"Functional": "Functional"})
-                state.reqs.get_children.return_value = ()
-                App.refresh_requirements(state, requirement)
+                state = SimpleNamespace(project_path=project.path, document=doc, tree=Mock(),
+                                        show_filters=Mock(), render=Mock(), select=Mock(),
+                                        active_filters=("SCM [SHLRSCM]", "Type: Functional"))
+                state.defaults = lambda: RequirementsView.defaults(state)
+                RequirementsView.refresh(state, project, doc, requirement)
                 self.assertEqual(state.active_filters, ("All sections", "All types"))
-                self.assertEqual(state.fill_editor.call_args.args[0]["id"], requirement)
-                state.reqs.selection_set.assert_called_once_with(requirement)
+                self.assertEqual(state.selected, requirement)
+                state.select.assert_called_once_with(requirement, reveal=True)
             finally:
                 project.close()
 
     def test_save_during_navigation_keeps_the_requested_selection(self):
         from app import App
-        tree = Mock()
-        tree.selection.return_value = ("SYS2",)
-        state = SimpleNamespace(reqs=tree, requirement="SYS1", busy=False, document=1,
-                                project=Mock(), fill_editor=Mock())
-        state.project.requirements.return_value = [{"id": "SYS1"}, {"id": "SYS2"}]
+        state = SimpleNamespace(requirement="SYS1", busy=False, document=1, requirements_view=Mock(),
+                                project=Mock(), docs=Mock(), refresh_requirements=Mock())
+        state.project.requirements.return_value = [{"id": "SYS1", "document": 1}, {"id": "SYS2", "document": 1}]
 
         def save_current():
-            tree.selection.return_value = ("SYS1",)
+            state.requirement = "SYS1"
             return True
 
         state.confirm_edits = save_current
-        App.select_requirement(state)
-        state.fill_editor.assert_called_once_with({"id": "SYS2"})
-        tree.selection_set.assert_called_with("SYS2")
+        self.assertTrue(App.select_requirement(state, "SYS2"))
+        state.refresh_requirements.assert_called_once_with("SYS2")
 
     def test_cancel_navigation_keeps_current_requirement(self):
         from app import App
-        state = SimpleNamespace(reqs=Mock(), requirement="SYS1", busy=False,
-                                confirm_edits=lambda: False, fill_editor=Mock())
-        state.reqs.selection.return_value = ("SYS2",)
-        App.select_requirement(state)
-        state.reqs.selection_set.assert_called_once_with("SYS1")
-        state.fill_editor.assert_not_called()
+        state = SimpleNamespace(requirement="SYS1", busy=False,
+                                confirm_edits=lambda: False, refresh_requirements=Mock())
+        self.assertFalse(App.select_requirement(state, "SYS2"))
+        self.assertEqual(state.requirement, "SYS1")
+        state.refresh_requirements.assert_not_called()
 
     def test_live_gui_create_save_switch_and_reopen(self):
         import tkinter as tk
@@ -342,7 +405,7 @@ class ControllerTests(unittest.TestCase):
                 app.title_text.set("Report sensor")
                 app.save()
                 app.title_text.set("Report updated sensor")
-                app.reqs.selection_set("EBBSYS1")
+                app.requirements_view.tree.selection_set("EBBSYS1")
                 app.update()
                 self.assertEqual(app.requirement, "EBBSYS1")
                 self.assertEqual(app.project.requirements(doc)[1]["title"], "Report updated sensor")
@@ -352,9 +415,9 @@ class ControllerTests(unittest.TestCase):
                 app.type_text.set("Usability")
                 app.save()
                 self.assertEqual(app.requirement, "EBBSYS1")
-                app.section_filter.set("IOM [SHLRIOM]")
-                app.type_filter.set("Type: Usability")
-                app.change_filters()
+                app.requirements_view.section_filter.set("IOM [SHLRIOM]")
+                app.requirements_view.type_filter.set("Type: Usability")
+                app.requirements_view.change_filters()
                 app.new_requirement()
                 app.title_text.set("New IOM requirement")
                 app.save()
@@ -363,6 +426,55 @@ class ControllerTests(unittest.TestCase):
                 app.project.close()
                 app.project = Project(path)
                 self.assertEqual(len(app.project.requirements()), 3)
+                system = app.project.add_document("System", "SYS")
+                parent = app.project.save_requirement(system, None, "System parent", "")
+                app.docs.insert("", "end", iid=str(system), values=("System",))
+                app.project.link(parent, "EBBSYS1")
+                app.refresh_requirements("EBBSYS1")
+                app.notebook.select(app.matrix_view)
+                app.update()
+                self.assertEqual(len(app.matrix_view.nodes), 4)
+                self.assertEqual(len(app.matrix_view.lines), 1)
+                app.matrix_view.choose(parent)
+                app.update()
+                self.assertEqual(app.requirement, parent)
+                app.title_text.set("Unsaved system edit")
+                with patch("app.messagebox.askyesnocancel", return_value=None):
+                    app.matrix_view.choose("EBBSYS1")
+                    self.assertEqual(app.requirement, parent)
+                    self.assertEqual(app.matrix_view.selected, parent)
+                    self.assertEqual(app.title_text.get(), "Unsaved system edit")
+                app.matrix_view.choose("EBBSYS1")
+                app.update()
+                self.assertEqual(app.requirement, "EBBSYS1")
+                self.assertEqual(app.project.requirements(system)[0]["title"], "Unsaved system edit")
+                app.title_text.set("Draft survives tab switch")
+                app.notebook.select(app.requirements_view)
+                app.update()
+                group = f"section:{iom}"
+                app.requirements_view.tree.item(group, open=False)
+                app.requirements_view.sort("Title")
+                self.assertFalse(app.requirements_view.tree.item(group, "open"))
+                app.requirements_view.tree.selection_set(group)
+                app.update()
+                self.assertEqual(app.title_text.get(), "Draft survives tab switch")
+                self.assertEqual(app.requirement, "EBBSYS1")
+                app.notebook.select(app.matrix_view)
+                app.update()
+                self.assertEqual(app.title_text.get(), "Draft survives tab switch")
+                app.requirements_view.tree.selection_set(group)
+                app.delete_section()
+                window = next(w for w in app.winfo_children() if isinstance(w, tk.Toplevel))
+                frame = window.winfo_children()[0]
+                button = next(w for w in frame.winfo_children() if w.winfo_class() == "TButton"
+                              and w.cget("text") == "Delete section")
+                with patch("app.messagebox.askyesno", return_value=True):
+                    button.invoke()
+                app.update()
+                self.assertEqual(len(app.project.sections(doc)), 1)
+                self.assertEqual(app.requirement, "EBBSYS1")
+                self.assertFalse(app.requirements_view.tree.exists(group))
+                self.assertEqual(len(app.matrix_view.lines), 1)
                 self.assertEqual(callback_errors, [])
             finally:
                 app.project.close()

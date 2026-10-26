@@ -113,6 +113,29 @@ class Project:
         except sqlite3.IntegrityError:
             raise ValueError("Choose an existing document, a new section name, and a project-wide unique prefix.") from None
 
+    def delete_section(self, document, section, destination=None):
+        with self.db:
+            self.db.execute("UPDATE documents SET next_number=next_number WHERE id=?", (document,))
+            sections = {s["id"]: s for s in self.sections(document)}
+            if section not in sections:
+                raise ValueError("Choose an existing section in this document.")
+            remaining = [s for key, s in sections.items() if key != section]
+            if not remaining:
+                raise ValueError("Keep at least one section per document. Create another section first.")
+            if destination is not None and (destination == section or destination not in sections):
+                raise ValueError("Choose a different destination section in the same document.")
+            count = self.db.execute("SELECT COUNT(*) FROM requirements WHERE section=? AND deleted=0",
+                                    (section,)).fetchone()[0]
+            if count and destination is None:
+                raise ValueError("Choose a destination section for the existing requirements.")
+            # Move live requirements and retain deleted IDs, even when no destination is needed.
+            self.db.execute("UPDATE requirements SET section=? WHERE section=?", (destination, section))
+            first = remaining[0]
+            self.db.execute("UPDATE documents SET prefix=?, next_number=? WHERE id=? AND prefix=?",
+                            (first["prefix"], first["next_number"], document, sections[section]["prefix"]))
+            self.db.execute("DELETE FROM sections WHERE id=?", (section,))
+        return count
+
     def requirements(self, document=None, section=None, requirement_type=None):
         return self.db.execute(
             "SELECT r.*, d.name AS document_name, s.name AS section_name, s.prefix AS section_prefix "

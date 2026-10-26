@@ -1,7 +1,7 @@
 # Requirements Trace
 
 A small Python desktop tool for requirements, document-to-document trace links,
-and source-code tags. Three application files; no web server or framework.
+and source-code tags. Four application files; no web server or framework.
 
 ## Run
 
@@ -68,6 +68,55 @@ To move an existing requirement within its document, change **Section** and
 **Save**. Its ID stays fixed, including its original prefix. Changing its type
 also preserves its ID, trace links, and code tags.
 
+To remove a section, select its header or one of its requirements in the
+**Requirements** tab, then click **Delete section**. The dialog lets you choose
+the section explicitly. Empty sections can be deleted directly. For a populated
+section, choose another section in the same document to receive all its
+requirements, then confirm. IDs, types, links, and code locations stay intact.
+The table, filters, and trace diagram refresh after deletion.
+
+Each document keeps at least one section. To replace its only section, create
+another first. A removed section's prefix can be used again, while previously
+issued requirement IDs remain reserved, including deleted requirement IDs.
+
+## Requirements and Trace Matrix views
+
+The middle pane has two tabs. Both use the same project and requirement editor
+on the right. Switching tabs keeps your draft. Selecting a different requirement
+from either view prompts about unsaved changes. Drag the pane dividers or use the
+scrollbars to give a view more room.
+
+**Requirements** groups rows under collapsible section headers, such as
+`SCM [SHLRSCM] — 12`. The count reflects the active filters; empty matching
+sections are also shown. Click a section's arrow to collapse or expand it.
+Section headers organize the list; requirement rows open the editor.
+
+Click **Section / ID**, **Title**, or **Type** to sort requirements within every
+section. Click again to reverse the order. ID sorting uses numeric order
+(`SHLRSCM1`, `SHLRSCM2`, `SHLRSCM10`). Sorting keeps the selected requirement,
+draft, and collapsed sections. Sort/filter/collapse preferences last for this
+session and are not saved into the project.
+
+**Trace Matrix** compares two different documents:
+
+1. Open the tab and choose a **Left document** and **Right document**.
+2. Each column lists all requirements from that document, grouped by section,
+   including those with no links. Requirement-table filters do not limit this view.
+3. Lines show existing direct links between the chosen documents. Arrows point
+   from parent to child, including when the parent is in the right column.
+4. Click a requirement to highlight its connections and load it into the editor.
+   The selected requirement turns yellow and its connected requirements turn
+   blue. Full titles and descriptions are available in the editor.
+5. Use the shared **Link…**, **Unlink**, **Save**, and **Delete** controls to make
+   changes. The views refresh after changes. Trace lines themselves are for viewing.
+
+The comparison needs at least two documents. Selecting the same document on both
+sides adjusts the other selector to a different document. Vertical scrolling
+moves both columns together; horizontal scrolling supports narrower windows.
+The matrix shows links between these two documents; intermediate requirements in
+other documents are not expanded into indirect links. HTML/PDF exports remain
+the grouped project-wide tabular matrix.
+
 ## Rules and limits
 
 - Prefixes are converted to uppercase, start with a letter, and may contain
@@ -100,7 +149,7 @@ also preserves its ID, trace links, and code tags.
   compliance judgments. Top-level and non-software requirements can have gaps
   intentionally. Scan diagnostics remain in the results dialog, not the matrix.
 - Documents use this app's SQLite project format. No Word/PDF import, rich text,
-  document/section deletion or renaming, collaboration, baselines, or audit history yet.
+  document deletion, document/section renaming, collaboration, baselines, or audit history yet.
   PDF export uses an embedded Vera font; HTML is preferable for scripts that font
   does not cover.
 
@@ -110,10 +159,12 @@ also preserves its ID, trace links, and code tags.
 | --- | --- |
 | `storage.py` | SQLite schema/migration, sections, IDs, types, links, matrix, scanner |
 | `export.py` | HTML and PDF matrices grouped by document, section, and type |
-| `app.py` | Tkinter widgets, filters, editing, dialogs, background scan |
-| `test_trace.py` | Regression checks for storage, scanning, exports, and navigation |
+| `views.py` | Grouped/sortable requirement table, trace diagram, shared table widget |
+| `app.py` | Project lifecycle, shared editor, view registration, dialogs, background scan |
+| `test_trace.py` | Storage, scanning, exports, migration, and shared navigation checks |
+| `test_views.py` | Grouping, sorting, filtering, trace direction, and selection checks |
 
-Read `storage.py`, then `export.py`, then `app.py`. Add fields in the schema and
+Read `storage.py`, then `export.py`, then `views.py` and `app.py`. Add fields in the schema and
 storage methods first, expose them in the editor, then include them in `cells()`
 in `export.py`. Projects now use schema version 2. Opening a version 1 project
 automatically migrates it in a transaction: each document gets a `General` section
@@ -121,6 +172,17 @@ with its existing prefix/counter, requirements keep their IDs and gain a blank
 type, and links/code locations are preserved. Reopening does not repeat migration.
 The original version of the app cannot open upgraded files. There is no packaging
 or hidden application state.
+
+To add another tab, create a `ttk.Frame` class in `views.py` accepting
+`(parent, on_select, guard)`. Implement `refresh(project, selected)`,
+`highlight(requirement_id)`, and `set_enabled(enabled)`. Register it with
+`self.add_view("View name", YourView)` in `App.__init__`. Registered views receive
+project changes, selection changes, and enabled state automatically. Use
+`on_select(requirement_id)` to request selection through the shared editor; a
+false result means navigation was cancelled, so retain the previous highlight.
+Wrap GUI callbacks with `guard` to use the app's error dialogs. The Requirements
+tab also owns its filters and add/section controls. No new dependency or database
+migration is needed for these views; project files still use schema version 2.
 
 Run checks with `python -m unittest -v`. The PDF check skips without ReportLab;
 the live GUI check skips without a desktop display. Storage, scanning, HTML, and
